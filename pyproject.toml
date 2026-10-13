@@ -7,7 +7,7 @@ dependencies = [
     "azure-identity>=1.26.0",
     "httpx>=0.28.1",
     "langchain>=1.4.3",
-    "langchain-azure-ai[hosting,opentelemetry]>=1.2.9",
+    "langchain-azure-ai[hosting,opentelemetry]>=1.2.10",
     "langchain-openai>=1.6.7",
     "langgraph>=1.2.14",
     "lxml>=6.1.3,<7",  # <7: stay off the 7.0 beta that prerelease=allow would pick
