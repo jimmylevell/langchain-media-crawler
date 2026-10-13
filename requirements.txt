@@ -13,7 +13,7 @@ aiosignal==1.4.0
     # via aiohttp
 annotated-types==0.8.0
     # via pydantic
-anthropic==0.125.0
+anthropic==1.13.0
     # via
     #   langchain-anthropic
     #   langchain-azure-ai
