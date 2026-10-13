@@ -546,7 +546,7 @@ urllib3==2.8.0
     #   htmldate
     #   requests
     #   trafilatura
-uuid-utils==0.17.1
+uuid-utils==1.0.0
     # via
     #   langchain-core
     #   langsmith
