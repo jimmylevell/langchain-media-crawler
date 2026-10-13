@@ -4,24 +4,28 @@ Plain code, no LLM: fetch the list pages and feeds of all registered sources one
 after the other and keep only the entries inside the time window. The agents then
 get these entries as a ready-made list and open only the ones worth reading.
 
+Three kinds of sources feed the list:
+- the registry (scanner/sources.py): authorities, newspapers, magazines, associations
+- official APIs (scanner/amtlich.py): Amtsblatt portal, simap
+- discovery (scanner/discover.py): outlets that are not in the registry but write about the region
+  (needs a search server, SEARXNG_URL)
+
 This replaces agents crawling the sites themselves, which used up the request
 limit of the shared municipal hoster and got the run blocked, and it replaces
 hit-and-miss web searches for newspaper articles.
 """
 from __future__ import annotations
 
-import html as htmllib
-import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, timedelta
-from email.utils import parsedate_to_datetime
 from typing import Callable
 from urllib.robotparser import RobotFileParser
 
-from . import cache
-from .config import RunConfig
-from .sources import Liste, Quelle, orte_fuer, quellen_fuer
+from . import amtlich, cache, discover
+from .config import SEARXNG_URL, RunConfig
+from .parsers import PARSER
+from .sources import Liste, Quelle, orte_muster, quellen_fuer
 from .tools import PAUSE, PAUSE_COLLECTED, RunLog, host_of, norm_url, polite_get, polite_get_raw
 
 VORSCHAU_TAGE = 60  # upcoming sessions and votes are listed this far ahead
@@ -30,11 +34,6 @@ LIST_CACHE_HOURS = 3  # a list read less than this long ago is not fetched again
 # kept for half a year and refreshed for one site per run. Its rules apply once known.
 ROBOTS_CACHE_HOURS = 180 * 24
 ROBOTS_CHECKS_PER_RUN = 1
-DATE_FIELDS = ("_datum", "datum-sort", "_geschaeftsdatum", "datumVon-sort", "datumVon", "datum")
-ISO = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
-CH = re.compile(r"(\d{1,2})\.(\d{1,2})\.(\d{4})")
-
-Zeile = tuple[date | None, str, str, str]  # date, title, absolute url, teaser
 
 
 @dataclass(frozen=True)
@@ -47,10 +46,12 @@ class Eintrag:
     quellgattung: str
     zukunft: bool
     anriss: str = ""
+    direkt: bool = False  # the API answer already is the evidence; an agent need not open the page
 
     def zeile(self) -> str:
         teaser = f" — {self.anriss[:160]}" if self.anriss else ""
-        return f"- {self.datum.isoformat()} | {self.art} | {self.quelle} | {self.titel}{teaser} | {self.url}"
+        art = f"{self.art} (Direktbeleg)" if self.direkt else self.art
+        return f"- {self.datum.isoformat()} | {art} | {self.quelle} | {self.titel}{teaser} | {self.url}"
 
 
 @dataclass
@@ -59,6 +60,7 @@ class Sammlung:
     listen_gelesen: int = 0
     websites: int = 0
     eintraege_total: int = 0
+    entdeckt: list[discover.Entdeckt] = field(default_factory=list)
 
     def zusammenfassung(self) -> str:
         return (
@@ -67,91 +69,9 @@ class Sammlung:
         )
 
 
-# --- parsers ------------------------------------------------------------------
-def _date(value: str) -> date | None:
-    if m := ISO.search(value):
-        y, mo, d = map(int, m.groups())
-    elif m := CH.search(value):
-        d, mo, y = map(int, m.groups())
-    else:
-        try:  # RSS: "Tue, 08 Sep 2026 07:53:50 +0000"
-            return parsedate_to_datetime(value.strip()).date()
-        except (TypeError, ValueError):
-            return None
-    try:
-        return date(y, mo, d)
-    except ValueError:
-        return None
-
-
-def _text(fragment: str) -> str:
-    fragment = re.sub(r"<!\[CDATA\[(.*?)\]\]>", r"\1", fragment, flags=re.S)
-    return " ".join(htmllib.unescape(re.sub(r"<[^>]+>", " ", htmllib.unescape(fragment))).split())
-
-
-def _tag(block: str, *names: str) -> str:
-    for name in names:
-        if m := re.search(rf"<{name}(?:\s[^>]*)?>(.*?)</{name}>", block, re.S):
-            return m.group(1).strip()
-    return ""
-
-
-def parse_iweb(page_html: str, base: str) -> list[Zeile]:
-    """The list the municipal web platform embeds in the page as JSON."""
-    m = re.search(r'data-entities="([^"]+)"', page_html)
-    if not m:
-        return []
-    try:
-        rows = json.loads(htmllib.unescape(m.group(1))).get("data", [])
-    except (ValueError, AttributeError):
-        return []
-    out: list[Zeile] = []
-    for row in rows:
-        cell = str(row.get("name") or row.get("title") or "")
-        link = re.search(r'href="([^"]+)"', cell)
-        titel = _text(cell)
-        if link and titel:
-            href = link.group(1)
-            d = next((x for x in (_date(str(row.get(k) or "")) for k in DATE_FIELDS) if x), None)
-            out.append((d, titel, href if href.startswith("http") else base + href, ""))
-    return out
-
-
-def parse_rss(xml: str, base: str) -> list[Zeile]:
-    """RSS 2.0 and Atom."""
-    out: list[Zeile] = []
-    for item in re.findall(r"<(?:item|entry)[\s>].*?</(?:item|entry)>", xml, re.S):
-        link = _text(_tag(item, "link")) or (re.search(r'<link[^>]+href="([^"]+)"', item) or [None, ""])[1]
-        titel = _text(_tag(item, "title"))
-        if link and titel:
-            d = _date(_tag(item, "pubDate", "published", "updated", "dc:date"))
-            out.append((d, titel, link, _text(_tag(item, "description", "summary"))[:400]))
-    return out
-
-
-def parse_sitemap(xml: str, base: str) -> list[Zeile]:
-    """XML sitemaps that carry a date per URL. The title comes from the news or video
-    extension if present, else from the URL."""
-    out: list[Zeile] = []
-    for block in re.findall(r"<url>.*?</url>", xml, re.S):
-        loc = _text(_tag(block, "loc"))
-        if not loc:
-            continue
-        titel = _text(_tag(block, "news:title", "video:title"))
-        if not titel:
-            slug = re.sub(r"-(?:art|ld)?[-.]?\d+$", "", loc.rstrip("/").rsplit("/", 1)[-1])
-            titel = slug.replace("-", " ").strip().capitalize()
-        d = _date(_tag(block, "news:publication_date", "lastmod"))
-        out.append((d, titel, loc, ""))
-    return out
-
-
-PARSER = {"iweb": parse_iweb, "rss": parse_rss, "sitemap": parse_sitemap}
-
-
 # --- collecting -----------------------------------------------------------------
-def _im_fenster(d: date, liste: Liste, cfg: RunConfig) -> bool:
-    if liste.zukunft:
+def _im_fenster(d: date, zukunft: bool, cfg: RunConfig) -> bool:
+    if zukunft:
         return cfg.laufdatum <= d <= cfg.laufdatum + timedelta(days=VORSCHAU_TAGE)
     return cfg.nachzuegler_start <= d <= cfg.laufdatum
 
@@ -184,21 +104,43 @@ def _robots_schonend(log: RunLog, base: str, budget: list[int]) -> None:
         log.robots[base] = rp
 
 
+class _Filter:
+    """Window, region and duplicate rules shared by all kinds of sources."""
+
+    def __init__(self, cfg: RunConfig, log: RunLog, result: Sammlung):
+        self.cfg, self.log, self.result = cfg, log, result
+        self.orte = orte_muster(cfg.kantone)
+        self.seen: set[str] = set()
+        self.titles: set[str] = set()  # regional papers share articles: the same headline is listed once
+
+    def nimm(self, d: date | None, titel: str, url: str, anriss: str, *, art: str, quelle: str, quellgattung: str,
+             zukunft: bool = False, regional: bool = False, ausschluss: str = "", titel_pruefen: bool = True, direkt: bool = False) -> None:
+        if d is None or not _im_fenster(d, zukunft, self.cfg) or norm_url(url) in self.seen:
+            return
+        if ausschluss and re.search(ausschluss, url):
+            return
+        if regional and not self.orte.search(f"{titel} {anriss} {url}"):
+            return
+        if titel_pruefen:
+            key = re.sub(r"\W+", "", titel.lower())
+            if key in self.titles:
+                return
+            self.titles.add(key)
+        self.seen.add(norm_url(url))
+        self.result.eintraege.append(Eintrag(d, art, quelle, titel[:160], url, quellgattung, zukunft, anriss, direkt))
+        if direkt:
+            self.log.mark_read(url)
+        elif anriss:
+            self.log.teasers[norm_url(url)] = (titel, d.isoformat(), anriss)
+
+
 def collect(cfg: RunConfig, log: RunLog, on_event: Callable[[str], None] = lambda _: None) -> Sammlung:
     quellen: list[Quelle] = quellen_fuer(cfg.kantone)
-    # whole words only ("Kerns" must not match "Kernstück"); short canton codes case-sensitive
-    namen = [o for o in orte_fuer(cfg.kantone) if len(o) > 2]
-    codes = [o for o in orte_fuer(cfg.kantone) if len(o) <= 2]
-    orte = re.compile(
-        r"\b(?i:" + "|".join(re.escape(o) for o in namen) + r")(?i:er|ern|s)?\b" + (r"|\b(?:" + "|".join(codes) + r")\b" if codes else "")
-        if namen else r"$^"
-    )
     result = Sammlung(eintraege=[])
+    nimm = _Filter(cfg, log, result)
     with log.lock:  # from now on agents may only open collected entries on these hosts
         log.collected_hosts.update(host_of(f"https://{q.host}") for q in quellen)
         log.budget_hosts.update(host_of(f"https://{q.host}") for q in quellen if q.knapp)
-    seen: set[str] = set()
-    titles: set[str] = set()  # regional papers share articles: the same headline is listed once
     robots_checks = [ROBOTS_CHECKS_PER_RUN]
     for q in quellen:
         base = f"https://{q.host}"
@@ -222,26 +164,33 @@ def collect(cfg: RunConfig, log: RunLog, on_event: Callable[[str], None] = lambd
                 result.listen_gelesen += 1
                 result.eintraege_total += len(rows)
                 for d, titel, url, anriss in rows:
-                    if d is None or not _im_fenster(d, liste, cfg) or norm_url(url) in seen:
-                        continue
-                    if liste.ausschluss and re.search(liste.ausschluss, url):
-                        continue
-                    if liste.regional and not orte.search(f"{titel} {anriss} {url}"):
-                        continue
-                    if liste.typ != "iweb":
-                        key = re.sub(r"\W+", "", titel.lower())
-                        if key in titles:
-                            continue
-                        titles.add(key)
-                    seen.add(norm_url(url))
-                    result.eintraege.append(
-                        Eintrag(d, liste.art, q.name, titel[:160], url, liste.quellgattung, liste.zukunft, anriss)
-                    )
-                    if anriss:
-                        log.teasers[norm_url(url)] = (titel, d.isoformat(), anriss)
+                    nimm.nimm(d, titel, url, anriss, art=liste.art, quelle=q.name, quellgattung=liste.quellgattung, zukunft=liste.zukunft,
+                              regional=liste.regional, ausschluss=liste.ausschluss, titel_pruefen=liste.typ != "iweb")
         result.websites += answered
         on_event(f"  · {q.name}: {'gelesen' if answered else 'nicht erreichbar'}")
+
+    for source, reader in (("Amtsblatt-Portal", amtlich.amtsblatt), ("simap", amtlich.simap)):
+        rows, requests = reader(cfg, log)
+        result.listen_gelesen += requests
+        result.websites += bool(requests)
+        result.eintraege_total += len(rows)
+        for r in rows:
+            nimm.nimm(r.datum, r.titel, r.url, r.anriss, art=r.art, quelle=r.quelle, quellgattung=r.quellgattung, titel_pruefen=False, direkt=True)
+        on_event(f"  · {source}: {len(rows)} Einträge" if requests else f"  · {source}: nicht erreichbar")
+
+    articles, _ = discover.discover(cfg, log, {q.host.removeprefix("www.") for q in quellen})
+    for host, (d, titel, url, anriss) in articles:
+        result.eintraege_total += 1
+        nimm.nimm(d, titel, url, anriss, art="Zeitungsartikel (entdeckt)", quelle=host, quellgattung="Lokale Medien", regional=True)
+    counts: dict[str, int] = {}
+    for e in result.eintraege:
+        if e.art == "Zeitungsartikel (entdeckt)":
+            counts[e.quelle] = counts.get(e.quelle, 0) + 1
+    result.entdeckt = [discover.Entdeckt(h, n) for h, n in sorted(counts.items(), key=lambda kv: -kv[1])]
+    result.websites += len(result.entdeckt)
+    on_event("  · Entdeckte Medien: " + (", ".join(o.host for o in result.entdeckt) or ("keine" if SEARXNG_URL else "aus (SEARXNG_URL nicht gesetzt)")))
+
     with log.lock:
-        log.collected_urls.update(seen)
+        log.collected_urls.update(u for u in nimm.seen if host_of(u) in log.collected_hosts)
     result.eintraege.sort(key=lambda e: (e.quellgattung, e.quelle, -e.datum.toordinal()))
     return result

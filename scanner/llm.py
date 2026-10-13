@@ -1,7 +1,7 @@
 """Chat model on Azure OpenAI / Microsoft Foundry.
 
 Two ways in, chosen by environment:
-- AZURE_OPENAI_ENDPOINT set  → Azure OpenAI endpoint, API key or Entra ID (local, App Service).
+- AZURE_OPENAI_ENDPOINT set  → Azure OpenAI endpoint, API key or Entra ID (local runs).
 - only FOUNDRY_PROJECT_ENDPOINT → Foundry project endpoint with the agent's identity
   (this is what a Foundry hosted agent container gets injected).
 """

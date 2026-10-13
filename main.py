@@ -20,6 +20,7 @@ from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 
+from scanner import telemetry
 from scanner.config import RunConfig
 from scanner.graph import run_scan
 from scanner.llm import make_llm
@@ -30,6 +31,7 @@ Standard: Niederlassung Stans, Region «Nidwalden, Obwalden und angrenzende Geme
 Nennt der Benutzer eine andere Niederlassung, Region oder Periode, überschreibt das den Standard; sonst Feld leer bzw. 0 lassen.
 `kantone`: Kantonskürzel der genannten Region (z.B. UR, SZ, LU), leer wenn Standard.
 `geplant`: true, wenn die Nachricht leer ist, nur einen Start auslöst («Scan starten», «wöchentlicher Lauf») oder kein Mensch mitliest.
+`testlauf`: true, wenn ausdrücklich ein Test- oder Probelauf verlangt wird; dann wird nichts gespeichert.
 `rueckfrage`: nur ausfüllen, wenn Region oder Zeitraum tatsächlich unklar oder widersprüchlich sind – eine einzige kurze Frage. Im Zweifel leer lassen und Standard verwenden."""
 
 
@@ -40,6 +42,7 @@ class Intake(BaseModel):
     kantone: list[str] = Field(description="Kantonskürzel oder []")
     tage: int = Field(description="Zeitraum in Tagen, 0 = Standard")
     kontaktentwurf: bool = Field(description="true, wenn ein Entwurf für die Kontaktaufnahme verlangt wird")
+    testlauf: bool = Field(description="true bei ausdrücklich verlangtem Testlauf")
     geplant: bool
     rueckfrage: str
 
@@ -51,6 +54,7 @@ class State(TypedDict, total=False):
 
 def create_graph():
     """Graph factory loaded by the hosting adapter."""
+    telemetry.setup(hosted=True)  # the Foundry host already configures the exporter
     llm = make_llm()
 
     def intake(state: State) -> State:
@@ -73,6 +77,7 @@ def create_graph():
             tage=min(max(i.tage, 0), 31) or d.tage,
             kontaktentwurf=i.kontaktentwurf,
             geplant=i.geplant or not overridden,
+            dry_run=i.testlauf,
         )
         result = run_scan(cfg, llm=llm)
         return {"messages": [AIMessage(content=result["markdown"])]}

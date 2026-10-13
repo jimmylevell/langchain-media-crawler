@@ -7,13 +7,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-import threading
-import time
-
 import os
+import time
 from pathlib import Path
 
 from .config import DATA_DIR
+from .store import read_json, update_json
 
 CACHE_DIR = Path(os.getenv("SCANNER_CACHE_DIR") or DATA_DIR / "cache")
 
@@ -42,25 +41,21 @@ def put(url: str, text: str) -> None:
 # The shared municipal hoster closes a server to an address that sent it roughly 30
 # requests within an hour, whatever the pace. The ledger counts our requests per server
 # across runs, so a second run or a test shortly after the first cannot push us over.
-_ledger_lock = threading.Lock()
-
-
-def _ledger() -> dict[str, list[float]]:
-    try:
-        return json.loads((CACHE_DIR / "requests.json").read_text("utf-8"))
-    except (OSError, ValueError):
-        return {}
+def _ledger_file() -> Path:
+    return CACHE_DIR / "requests.json"
 
 
 def requests_in_window(server: str, window_seconds: int = 3600) -> int:
     cutoff = time.time() - window_seconds
-    return sum(t > cutoff for t in _ledger().get(server, []))
+    return sum(t > cutoff for t in read_json(_ledger_file(), {}).get(server, []))
 
 
 def record_request(server: str, window_seconds: int = 3600) -> None:
-    with _ledger_lock:
-        cutoff = time.time() - window_seconds
-        ledger = {k: [t for t in v if t > cutoff] for k, v in _ledger().items()}
-        ledger.setdefault(server, []).append(time.time())
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        (CACHE_DIR / "requests.json").write_text(json.dumps(ledger), "utf-8")
+    now = time.time()
+
+    def change(ledger: dict) -> dict:
+        ledger = {k: [t for t in v if t > now - window_seconds] for k, v in ledger.items()}
+        ledger.setdefault(server, []).append(now)
+        return ledger
+
+    update_json(_ledger_file(), {}, change)

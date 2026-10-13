@@ -11,8 +11,9 @@ import sys
 import time
 from datetime import date
 
-from scanner.collect import collect, parse_iweb, parse_rss, parse_sitemap
+from scanner.collect import collect
 from scanner.config import RunConfig
+from scanner.parsers import parse_ihz, parse_iweb, parse_rss, parse_sitemap
 from scanner.tools import RunLog, make_tools, norm_url
 
 
@@ -59,7 +60,25 @@ def test_parser() -> None:
         (date(2026, 10, 8), "Firma zieht nach Stans", "https://bote.example/nachrichten/firma-zieht-nach-stans-art-1725900", ""),
         (date(2026, 10, 3), "Gewerbeausstellung sarnen eroeffnet", "https://u24.example/news/gewerbeausstellung-sarnen-eroeffnet/", ""),
     ], parse_sitemap(sitemap, "")
-    print("Parser (Gemeindeplattform, RSS, Sitemap): OK")
+
+    ihz = """<ul class="c-event"><li class="c-event__group">Oktober 2026
+      <ul class="c-event__list"><li><div class="c-event-item"><span>15.</span><span>Donnerstag</span><span>Export-Seminare</span>
+        <h3>Ursprung und Freihandelsverträge</h3><p>Sicherheit bei Zollpräferenzen</p><span>08.30 - 16.30 Uhr</span><span>Luzern, Hotel</span>
+        <a href="/netzwerk-anlaesse/anlaesse/detail/ursprung-2026/">Link zum Event</a></div></li>
+        <li><div class="c-event-item"><span>18.</span><span>Mittwoch</span><span>Innovationspreis</span><span>, Netzwerk</span>
+        <h3>Innovationspreisfeier</h3><span>11.30
+                   - 14.00 Uhr</span><span>Emmenbrücke</span>
+        <a href="/netzwerk-anlaesse/anlaesse/detail/preis/">Link zum Event</a></div></li></ul></li></ul>"""
+    got = parse_ihz(ihz, "https://www.ihz.ch")
+    assert got == [
+        (date(2026, 10, 15), "Ursprung und Freihandelsverträge", "https://www.ihz.ch/netzwerk-anlaesse/anlaesse/detail/ursprung-2026/",
+         "Export-Seminare | Sicherheit bei Zollpräferenzen | 08.30 - 16.30 Uhr | Luzern, Hotel"),
+        (date(2026, 10, 18), "Innovationspreisfeier", "https://www.ihz.ch/netzwerk-anlaesse/anlaesse/detail/preis/",
+         "Innovationspreis | 11.30 - 14.00 Uhr | Emmenbrücke"),
+    ], got
+    assert parse_ihz("<html></html>", "https://x.ch") == []
+    assert parse_rss("kein xml", "") == [] and parse_sitemap("", "") == []
+    print("Parser (Gemeindeplattform, RSS, Sitemap, IHZ): OK")
 
 
 def test_gatekeeping() -> None:
@@ -68,7 +87,7 @@ def test_gatekeeping() -> None:
     log.collected_hosts.add("example.invalid")
     log.budget_hosts.add("example.invalid")
     log.collected_urls.add(norm_url("https://www.example.invalid/_rte/information/1"))
-    _, fetch_page, list_links, _ = make_tools(RunConfig(), log)
+    fetch_page, list_links, _ = make_tools(RunConfig(), log)  # no web_search without SEARXNG_URL
     assert fetch_page.invoke({"url": "https://www.example.invalid/irgendwas"}).startswith("NICHT NÖTIG")
     assert list_links.invoke({"url": "https://www.example.invalid/aktuellesinformationen"}).startswith("NICHT NÖTIG")
     assert not log.blocked and not log.hosts, "gatekeeping must not touch the network"

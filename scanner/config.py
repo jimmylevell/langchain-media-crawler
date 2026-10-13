@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# On Azure App Service only /home survives restarts, so point DATA_DIR there.
+# history, request ledger and cache live here; in a Foundry container this is not persistent
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 USER_AGENT = os.getenv("SCANNER_USER_AGENT", "AkquiseScanner/0.1 (regional media scan)")
 SEARXNG_URL = os.getenv("SEARXNG_URL", "").rstrip("/")
@@ -25,12 +25,14 @@ class RunConfig:
     kantone: list[str] = field(default_factory=lambda: ["NW", "OW"])  # for the SHAB query
     tage: int = 7
     empfaenger: str = ""
-    min_jubilaeum: int = 25
+    min_jubilaeum: int = 10
     laufdatum: date = field(default_factory=date.today)
     kontaktentwurf: bool = False
     geplant: bool = True  # scheduled run: never ask back, note assumptions instead
-    max_treffer: int = 10
+    max_treffer: int = 10  # rows in the list of local reports
+    max_shab: int = 5  # rows in the commercial-register list
     mit_niedrig: bool = False
+    dry_run: bool = False  # do not write history, task statistics or report file
 
     def __post_init__(self) -> None:
         if not self.empfaenger:

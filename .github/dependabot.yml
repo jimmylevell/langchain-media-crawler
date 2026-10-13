@@ -1,0 +1,23 @@
+version: 2
+updates:
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    groups:
+      # Azure and LangChain packages are released in lockstep, so they are updated together
+      azure:
+        patterns:
+          - "azure-*"
+          - "langchain-azure-ai*"
+          - "opentelemetry-*"
+      langchain:
+        patterns:
+          - "langchain*"
+          - "langgraph*"
+      minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"

@@ -39,6 +39,8 @@ from dotenv import load_dotenv
 load_dotenv()
 ROOT = Path(__file__).parent
 INCLUDE = ["main.py", "langgraph.json", "requirements.txt", "scanner"]
+# optional settings from .env that the container needs as well (it must be able to reach SEARXNG_URL)
+PASS_THROUGH = ["APPLICATIONINSIGHTS_CONNECTION_STRING", "SEARXNG_URL", "SHAB_MIN_KAPITAL", "MAX_PARALLEL_AGENTS"]
 AGENT_NAME = os.getenv("FOUNDRY_HOSTED_AGENT_NAME", "akquise-scanner")
 
 
@@ -78,6 +80,7 @@ def deploy(client: AIProjectClient, endpoint: str) -> None:
                     "FOUNDRY_PROJECT_ENDPOINT": endpoint,
                     "AZURE_AI_MODEL_DEPLOYMENT_NAME": model,
                     "DATA_DIR": "/tmp/scanner-data",  # container disk is not persistent
+                    **{k: os.environ[k] for k in PASS_THROUGH if os.getenv(k)},
                 },
                 protocol_versions=[ProtocolVersionRecord(protocol="responses", version="2.0.0")],
             ),

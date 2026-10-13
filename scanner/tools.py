@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import functools
 import os
+import re
 import socket
 import threading
 import time
@@ -25,6 +26,7 @@ from langchain_core.tools import tool
 
 from . import cache
 from .config import SEARXNG_URL, USER_AGENT, RunConfig
+from .netsafe import BlockedTarget, ensure_public
 
 BLOCK_STATUS = {401, 402, 403, 429, 451}
 PAYWALL_MARKERS = ("paywall", "piano-", "abo abschliessen", "jetzt abonnieren", "mit abo weiterlesen", "abopflichtig")
@@ -37,6 +39,7 @@ PAGE_CACHE_HOURS = 3
 SERVER_BUDGET = int(os.getenv("SERVER_BUDGET_PER_HOUR", "20"))
 PAYWALL_TEASER = "Paywall: nur Titel und Anriss gelesen"
 BUDGET = "Anfragebudget pro Server erreicht (Schutz vor Sperre); ein späterer Lauf liest weiter"
+SHAB_MIN_KAPITAL = int(os.getenv("SHAB_MIN_KAPITAL", "100000"))  # CHF; liquidations below it are not worth a call
 
 
 def norm_url(url: str) -> str:
@@ -84,7 +87,10 @@ class RunLog:
     host_locks: dict[str, threading.Lock] = field(default_factory=lambda: defaultdict(threading.Lock), repr=False)
     client: httpx.Client = field(
         default_factory=lambda: httpx.Client(
-            headers={"User-Agent": USER_AGENT, "Accept-Language": "de-CH,de;q=0.9"}, follow_redirects=True, timeout=25
+            headers={"User-Agent": USER_AGENT, "Accept-Language": "de-CH,de;q=0.9"},
+            follow_redirects=True,
+            timeout=25,
+            event_hooks={"request": [lambda request: ensure_public(str(request.url))]},  # also checks every redirect hop
         ),
         repr=False,
     )
@@ -158,6 +164,8 @@ def polite_get_raw(log: RunLog, url: str, pause: float) -> tuple[httpx.Response 
             cache.record_request(net)
         try:
             r = log.client.get(url, timeout=12)
+        except BlockedTarget:
+            return None, "interne Adresse"
         except httpx.HTTPError as e:
             r = None
             err = type(e).__name__
@@ -170,6 +178,11 @@ def polite_get(log: RunLog, url: str, pause: float = PAUSE) -> tuple[httpx.Respo
     Returns (response, "") or (None, message for the caller)."""
     if not url.startswith(("http://", "https://")):
         return None, "FEHLER: keine gültige http(s)-URL."
+    try:
+        ensure_public(url)
+    except BlockedTarget:
+        log.mark_blocked(host_of(url), "interne Adresse")
+        return None, f"GESPERRT (interne Adresse): {url} – nicht verwenden."
     host = host_of(url)
     net = network_of(urlsplit(url).netloc)
     if host in log.down_hosts or log.net_failures[net] >= 2:
@@ -186,6 +199,8 @@ def polite_get(log: RunLog, url: str, pause: float = PAUSE) -> tuple[httpx.Respo
             try:
                 r = log.client.get(url)
                 break
+            except BlockedTarget:
+                return None, f"GESPERRT (Weiterleitung auf interne Adresse): {url}"
             except httpx.HTTPError as e:
                 err = type(e).__name__
                 time.sleep(2)
@@ -207,8 +222,29 @@ def polite_get(log: RunLog, url: str, pause: float = PAUSE) -> tuple[httpx.Respo
     return r, ""
 
 
+def kapital(text: str) -> int | None:
+    """Share or LLC capital in CHF named in a SHAB notice, if any."""
+    m = re.search(r"kapital[^0-9]{0,40}([\d'’.,]+)", text, re.I)
+    digits = re.sub(r"\D", "", m.group(1).split(".")[0].split(",")[0]) if m else ""
+    return int(digits) if digits else None
+
+
+def shab_rauschen(titel: str, text: str) -> bool:
+    """Notices that never lead to a call: bankruptcy closed for lack of assets, plain deletions,
+    and liquidations of companies below SHAB_MIN_KAPITAL (capital unknown counts as below)."""
+    t = f"{titel} {text}".lower()
+    if "mangels aktiven" in t:
+        return True
+    if titel.lower().startswith("löschung") and not re.search(r"fusion|vermögensübertragung|übernahme", t):
+        return True
+    if re.search(r"liquidation|aufgelöst|auflösung", t) and (kapital(text) or 0) < SHAB_MIN_KAPITAL:
+        return True
+    return False
+
+
 def make_tools(cfg: RunConfig, log: RunLog, budget: int = 18) -> list:
-    """One tool set per research agent: `budget` caps that agent's tool calls."""
+    """One tool set per research agent: `budget` caps that agent's tool calls.
+    web_search is only offered when SEARXNG_URL points to a search server."""
     client = log.client
     calls = 0
 
@@ -239,27 +275,17 @@ def make_tools(cfg: RunConfig, log: RunLog, budget: int = 18) -> list:
         with log.lock:
             log.searches += 1
         try:
-            if SEARXNG_URL:
-                params = {"q": query, "format": "json", "language": "de-CH"}
-                if zeitraum != "alle":
-                    params["time_range"] = {"d": "day", "w": "week", "m": "month"}[zeitraum]
-                if typ == "news":
-                    params["categories"] = "news"
-                items = client.get(f"{SEARXNG_URL}/search", params=params).json().get("results", [])[:8]
-                rows = [(i.get("title"), i.get("url"), i.get("publishedDate") or "", i.get("content") or "") for i in items]
-            else:
-                from ddgs import DDGS
-
-                limit = None if zeitraum == "alle" else zeitraum
-                if typ == "news":
-                    items = DDGS().news(query, region="ch-de", timelimit=limit, max_results=8)
-                    rows = [(i.get("title"), i.get("url"), i.get("date") or "", i.get("body") or "") for i in items]
-                else:
-                    items = DDGS().text(query, region="ch-de", timelimit=limit, max_results=8)
-                    rows = [(i.get("title"), i.get("href"), "", i.get("body") or "") for i in items]
-        except Exception as e:  # search backends fail in many ways; the agent should just try another query
-            if "no results" in str(e).lower():
-                return "Keine Treffer."
+            params = {"q": query, "format": "json", "language": "de-CH"}
+            if zeitraum != "alle":
+                params["time_range"] = {"d": "day", "w": "week", "m": "month"}[zeitraum]
+            if typ == "news":
+                params["categories"] = "news"
+            # the search server is configured by the operator and may be local, so it bypasses the public-address check
+            response = httpx.get(f"{SEARXNG_URL}/search", params=params, timeout=25)
+            response.raise_for_status()
+            items = response.json().get("results", [])[:8]
+            rows = [(i.get("title"), i.get("url"), i.get("publishedDate") or "", i.get("content") or "") for i in items]
+        except (httpx.HTTPError, ValueError) as e:  # the agent should just try another query
             log.mark_blocked("Websuche", f"einzelne Suchanfragen fehlgeschlagen ({type(e).__name__})")
             return f"FEHLER Suche: {e}"
         if not rows:
@@ -340,7 +366,8 @@ def make_tools(cfg: RunConfig, log: RunLog, budget: int = 18) -> list:
     def shab_publications(stichwort: str = "", seite: int = 0) -> str:
         """Handelsregister-Publikationen im Schweizerischen Handelsamtsblatt (SHAB) für die Kantone der Region
         im Zeitfenster inkl. Nachzügler-Frist, im Volltext. stichwort = EIN Suchwort ohne Operatoren (z.B. 'Revisionsstelle',
-        'Sitzverlegung', 'Fusion', 'Liquidation', 'Opting'); leer = alle. Je Seite 40 Einträge.
+        'Sitzverlegung', 'Fusion', 'Opting'); leer = alle. Je Seite 40 Einträge. Konkurse mangels Aktiven, Löschungen und
+        kleine Liquidationen sind bereits aussortiert.
         Jede Zeile: Publikationsdatum | Titel | Meldungstext | URL. Datum und URL sind direkt zitierfähig."""
         if msg := over_budget():
             return msg
@@ -364,17 +391,21 @@ def make_tools(cfg: RunConfig, log: RunLog, budget: int = 18) -> list:
             log.mark_blocked("shab.ch", f"API-Fehler ({type(e).__name__})")
             return f"FEHLER SHAB: {e}"
         log.mark_ok("shab.ch")
-        lines = []
+        lines, aussortiert = [], 0
         for item in data.get("content", []):
             meta, content = item["meta"], item.get("content") or {}
+            titel, text = meta["title"].get("de", ""), content.get("publicationText") or ""
+            if shab_rauschen(titel, text):
+                aussortiert += 1
+                continue
             url = f"https://www.shab.ch/#!/search/publications/detail/{meta['id']}"
             log.mark_read(url)
-            lines.append(
-                f"- {meta['publicationDate'][:10]} | {meta['title'].get('de', '')} | "
-                f"{(content.get('publicationText') or '')[:900]} | {url}"
-            )
+            lines.append(f"- {meta['publicationDate'][:10]} | {titel} | {text[:900]} | {url}")
         total = data.get("total", len(lines))
-        head = f"{total} Publikationen ({', '.join(cfg.kantone)}, {cfg.nachzuegler_start} bis {cfg.laufdatum}), Seite {seite}:"
+        head = (
+            f"{total} Publikationen ({', '.join(cfg.kantone)}, {cfg.nachzuegler_start} bis {cfg.laufdatum}), Seite {seite}; "
+            f"{aussortiert} davon als Rauschen aussortiert (Konkurs mangels Aktiven, Löschungen, kleine Liquidationen):"
+        )
         return head + "\n" + "\n".join(lines) if lines else "Keine Publikationen."
 
-    return [web_search, fetch_page, list_links, shab_publications]
+    return [fetch_page, list_links, shab_publications] + ([web_search] if SEARXNG_URL else [])

@@ -45,17 +45,15 @@ class ScriptedModel(BaseChatModel):
         if "Plan" in self.tool_names:
             return self._call("Plan", {"tasks": [{"quellgattung": "SHAB/Handelsregister", "auftrag": "Neueintragungen prüfen", "suchhinweise": []}]})
         if "Report" in self.tool_names:
-            findings = json.loads(messages[-1].content.split("(JSON):\n")[1].split("\n\nFrüher gemeldet")[0])
-            rows = [
-                {"prio": "MITTEL", "organisation": f["organisation"], "ereignis": f["ereignis"], "ereignisdatum": "",
-                 "publikationsdatum": f["publikationsdatum"], "relevanz": "Neugründung, Bedarf an Buchführung möglich (Einschätzung)",
-                 "aktion": "Rufen Sie die Inhaberin oder den Inhaber an.", "quelle_name": "SHAB", "quelle_url": f["quelle_url"]}
-                for f in findings
+            kandidaten = json.loads(messages[-1].content.split("(JSON):\n")[1].split("\n\nFrüher gemeldet")[0])
+            zeilen = [
+                {"nr": k["nr"], "ereignis": k["ereignis"], "relevanz": "Revisionsstelle betroffen, Mandat möglich (Einschätzung)",
+                 "aktion": "Rufen Sie die Geschäftsleitung an.", "kontaktentwurf": ""}
+                for k in kandidaten
             ]
-            # one row with an invented URL: the self-check must remove it
-            rows.append({**rows[0], "organisation": "Erfundene AG", "quelle_url": "https://example.com/erfunden"})
-            top = {"organisation": rows[0]["organisation"], "naechster_schritt": "Anrufen", "fakten": rows[0]["ereignis"], "einschaetzung": "Bedarf möglich", "kontaktentwurf": ""}
-            return self._call("Report", {"zeilen": rows, "top": top, "verworfen": []})
+            # one row with an invented number: joining the wording to the findings must drop it
+            zeilen.append({**zeilen[0], "nr": 999, "ereignis": "Erfundene AG"})
+            return self._call("Report", {"zeilen": zeilen, "verworfen": []})
         # research agent: one SHAB call, then report the first publication
         tool_out = [m for m in messages if isinstance(m, ToolMessage)]
         if not tool_out:
@@ -64,7 +62,9 @@ class ScriptedModel(BaseChatModel):
         findings = []
         if first:
             datum, titel, text, url = [p.strip() for p in first[2:].split(" | ")]
-            findings = [{"organisation": re.sub(r"^\S+ ", "", titel), "ereignis": titel, "ereignisdatum": "", "publikationsdatum": datum,
+            ort = re.sub(r"\s*\(\w\w\)$", "", titel.rsplit(",", 1)[-1].strip())  # "Mutation X AG, Stansstad" -> "Stansstad"
+            findings = [{"organisation": re.sub(r"^\S+ ", "", titel), "ort": ort, "ereignistyp": "revisionsstelle", "groesse": "mittel",
+                         "ereignis": titel, "ereignisdatum": "", "publikationsdatum": datum,
                          "quelle_name": "SHAB", "quelle_url": url, "personen": [], "belegzitat": text[:80]}]
         return self._call("TaskResult", {"findings": findings, "nicht_erreichbar": [], "verworfen": []})
 
@@ -72,14 +72,13 @@ class ScriptedModel(BaseChatModel):
 def main() -> None:
     sys.stdout.reconfigure(encoding="utf-8")
     cache.CACHE_DIR = Path("data/cache")  # reuse collected lists instead of fetching them again for a test
-    cfg = RunConfig()
+    cfg = RunConfig(dry_run=True)
 
     print("== Tools (live) ==")
     log = RunLog()
-    web_search, fetch_page, list_links, shab = make_tools(cfg, log)
+    fetch_page, list_links, shab = make_tools(cfg, log)  # no web_search without SEARXNG_URL
     for name, out in [
         ("shab_publications", shab.invoke({"stichwort": "Revisionsstelle"})),
-        ("web_search", web_search.invoke({"query": "Nidwalden Unternehmen", "typ": "news"})),
         ("list_links", list_links.invoke({"url": "https://www.gewerbe-nw.ch/"})),
         ("fetch_page", fetch_page.invoke({"url": "https://www.gewerbe-nw.ch/"})),
     ]:
@@ -89,9 +88,10 @@ def main() -> None:
     print("== Graph mit Stand-in-Modell ==")
     result = run_scan(cfg, llm=ScriptedModel(), on_event=print)
     print(result["markdown"])
-    assert "Erfundene AG" not in result["markdown"].split("## Abdeckungsprotokoll")[0], "invented URL passed the self-check"
-    assert "Quelle im Lauf nicht nachweislich gelesen" in result["markdown"]
+    assert "Erfundene AG" not in result["markdown"].split("## Abdeckungsprotokoll")[0], "invented row passed the join with the findings"
+    assert "## Handelsregister-Signale (SHAB)" in result["markdown"] and "Testlauf" in result["markdown"]
     assert result["treffer"] >= 1
+    assert not (Path(os.environ["DATA_DIR"]) / "history.json").exists(), "a dry run must not write the history"
     print("OK")
 
 
